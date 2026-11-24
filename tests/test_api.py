@@ -54,3 +54,72 @@ def test_analyze_bad_csv_400():
 def test_analyze_negative_limit_400():
     r = client.post("/api/analyze", json={"limit_us": -1, "csv_text": SAMPLE_CSV})
     assert r.status_code == 400
+
+
+def _sample_summary():
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
+    import solver  # 复用服务端同一聚合口径构造请求体
+    calls = solver.parse_csv(SAMPLE_CSV)
+    hosts, pairs = solver.build_pair_constraints(calls)
+    return hosts, [p.__dict__ for p in pairs]
+
+
+def test_analyze_summary_feasible_and_private():
+    hosts, constraints = _sample_summary()
+    r = client.post("/api/analyze_summary",
+                    json={"limit_us": 250, "hosts": hosts, "constraints": constraints})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    result = body["result"]
+    assert result["feasible_with_limit"] is True
+    assert result["offsets"]
+    assert result["bounds"]
+    # 摘要响应不含调用号与原始时刻
+    text = r.text
+    assert "c1" not in text and "1000000" not in text
+
+
+def test_analyze_summary_infeasible_min_limit():
+    hosts, constraints = _sample_summary()
+    r = client.post("/api/analyze_summary",
+                    json={"limit_us": 200, "hosts": hosts, "constraints": constraints})
+    body = r.json()
+    assert body["ok"] is True
+    assert body["result"]["feasible_with_limit"] is False
+    assert body["result"]["min_limit_us"] == 225
+
+
+def test_analyze_summary_contradiction_has_rows():
+    bad_csv = (
+        "call_id,caller,callee,req_send,req_recv,resp_send,resp_recv\n"
+        "x1,web1,app1,1000000,1000100,1000400,1000200\n"
+    )
+    import solver
+    calls = solver.parse_csv(bad_csv)
+    hosts, pairs = solver.build_pair_constraints(calls)
+    r = client.post("/api/analyze_summary",
+                    json={"limit_us": 1000, "hosts": hosts,
+                          "constraints": [p.__dict__ for p in pairs]})
+    body = r.json()
+    assert body["ok"] is True
+    result = body["result"]
+    assert result["consistent"] is False
+    assert result["contradiction"]["steps"][0]["row"] == 2
+
+
+def test_analyze_summary_bad_payload_400():
+    r = client.post("/api/analyze_summary",
+                    json={"limit_us": 100, "hosts": ["a"],
+                          "constraints": [{"u": "a", "v": "ghost",
+                                           "nn_w": 1, "nn_row": 1,
+                                           "lim_delta": 1, "lim_row": 1}]})
+    assert r.status_code == 400
+    assert r.json()["ok"] is False
+
+
+def test_analyze_summary_negative_limit_400():
+    r = client.post("/api/analyze_summary",
+                    json={"limit_us": -1, "hosts": ["a"], "constraints": []})
+    assert r.status_code == 400

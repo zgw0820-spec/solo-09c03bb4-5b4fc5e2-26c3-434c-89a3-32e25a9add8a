@@ -74,18 +74,26 @@ def test_parse_rejects_non_integer_timestamp():
 
 def test_parse_rejects_too_many_calls():
     header = "call_id,caller,callee,req_send,req_recv,resp_send,resp_recv\n"
-    rows = "".join(f"k{i},a,b,{i},{i + 1},{i + 2},{i + 3}\n" for i in range(81))
+    rows = "".join(f"k{i},a,b,{i},{i + 1},{i + 2},{i + 3}\n" for i in range(2001))
     try:
         solver.parse_csv(header + rows)
     except ValueError as e:
-        assert "80" in str(e)
+        assert "2000" in str(e)
     else:
-        raise AssertionError("应当拒绝超过 80 笔")
+        raise AssertionError("应当拒绝超过 2000 笔")
+
+
+def test_parse_accepts_2000_calls_and_rows_are_numbered():
+    header = "call_id,caller,callee,req_send,req_recv,resp_send,resp_recv\n"
+    rows = "".join(f"k{i},a,b,{i},{i + 1},{i + 2},{i + 3}\n" for i in range(2000))
+    calls = solver.parse_csv(header + rows)
+    assert len(calls) == 2000
+    assert calls[0].row == 2 and calls[-1].row == 2001  # 行号含表头，用于矛盾定位
 
 
 def test_parse_rejects_too_many_hosts():
     header = "call_id,caller,callee,req_send,req_recv,resp_send,resp_recv\n"
-    rows = "".join(f"k{i},h{i},hx,{i},{i + 1},{i + 2},{i + 3}\n" for i in range(16))
+    rows = "".join(f"k{i},h{i},hx,{i},{i + 1},{i + 2},{i + 3}\n" for i in range(17))
     try:
         solver.parse_csv(header + rows)
     except ValueError as e:

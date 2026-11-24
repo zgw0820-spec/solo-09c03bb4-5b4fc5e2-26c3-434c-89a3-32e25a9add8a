@@ -41,6 +41,7 @@
          background: #fde8e8; color: #9b1c1c; }
   .mono { font-family: ui-monospace, Consolas, monospace; }
   ul.steps { margin: 8px 0 0; padding-left: 20px; font-size: 13px; }
+  ul.steps li { margin-bottom: 4px; }
   details { font-size: 13px; color: #52606d; }
   details summary { cursor: pointer; font-weight: 600; color: #1f2933; }
   details p, details li { line-height: 1.7; }
@@ -61,11 +62,12 @@
         <input id="limit" type="number" min="0" step="1" value="200">
       </div>
       <div>
-        <label>上传调用 CSV（每批 ≤ 80 笔、≤ 16 台主机）</label>
+        <label>上传调用 CSV（每批 ≤ 2000 笔、≤ 16 台主机）</label>
         <input id="file" type="file" accept=".csv,text/csv">
       </div>
       <button id="sample-ok" type="button">载入试算样例</button>
       <button id="sample-bad" type="button">载入矛盾样例</button>
+      <button id="sample-pair" type="button">载入重复主机对样例</button>
     </div>
     <textarea id="csv" rows="9" spellcheck="false" placeholder="call_id,caller,callee,req_send,req_recv,resp_send,resp_recv"></textarea>
     <p class="hint">
@@ -73,6 +75,11 @@
       即调用号、调用方主机名、服务方主机名、请求发出、请求到达、应答发出、应答到达。
       四个时刻为整数微秒，各按所在主机自身的时钟记录；同一主机的钟差在整批内固定，两程耗时均须非负。
       试算：样例上限填 <b>200</b> 时无法同时达标（可求出最小可行上限），填 <b>250</b> 时全部达标。
+    </p>
+    <p class="hint">
+      隐私与规模：调用号与四个原始时刻只留在本浏览器；上送服务端的是按<b>有向主机对</b>聚合的约束摘要
+      （主机名、差值、原表行号），约束条数 = 出现过的主机对数，不随每对主机的调用数增长；两台主机互相调用时两个方向各自成条。
+      逐笔可达范围与耗时在浏览器内按服务端求出的同一套钟差本地计算。
     </p>
     <div class="row" style="margin-top:12px">
       <button id="run" class="primary" type="button">开始分析</button>
@@ -91,14 +98,21 @@
         <li>去程耗时 = (t2 − t1) − (o[b] − o[a]) ≥ 0</li>
         <li>回程耗时 = (t4 − t3) + (o[b] − o[a]) ≥ 0</li>
       </ul>
-      <p>所有约束都是差分约束：用 Bellman-Ford 判定可行并求一组整数钟差；逐笔可达范围来自全源最短路
-      （Floyd-Warshall）给出的 o[b] − o[a] 上下界；记录自洽但无法同时达标时，二分求出能解释这批记录的最小整数微秒上限，
-      并给出一套满足该上限的钟差及对应逐笔耗时。约束链出现负环（如某笔记录的两程无法同时非负）即判定记录彼此矛盾，提示复测。</p>
+      <p>所有约束都是差分约束。同一主机对之间的多笔调用只产生平行约束，平行边取最紧一条后与原体系等价，
+      因此浏览器先按有向主机对聚合：非负边权取最小、上限边差值取最大，摘要中保留每条胜出约束对应的原表行号。
+      服务端用 Bellman-Ford 判定可行并求一组整数钟差；逐笔可达范围来自全源最短路（Floyd-Warshall）给出的
+      o[b] − o[a] 上下界，在浏览器内套回每笔原始时刻计算；记录自洽但无法同时达标时，二分求出能解释这批记录的
+      最小整数微秒上限。约束链出现负环（如某笔记录的两程无法同时非负）即判定记录彼此矛盾，提示复测，
+      并按原表行号指出矛盾链（调用号重复时仍可按行号定位）。</p>
       <p>说明：模型只假设“钟差固定 + 两程非负”，不假设处理耗时（t3 − t2）非负等额外约束；钟差整体平移不改变耗时，页面展示的钟差已把最小值归零。</p>
     </details>
   </section>
 </main>
 <script>
+const MAX_CALLS = 2000;
+const MAX_HOSTS = 16;
+const FIELDS = ["call_id", "caller", "callee", "req_send", "req_recv", "resp_send", "resp_recv"];
+
 const SAMPLE_OK = `call_id,caller,callee,req_send,req_recv,resp_send,resp_recv
 c1,web1,app1,1000000,1000620,1000700,1000350
 c2,app1,db1,1000650,999930,1000000,1000920
@@ -107,12 +121,20 @@ c3,web1,db1,1000500,1000400,1000500,1001050
 const SAMPLE_BAD = `call_id,caller,callee,req_send,req_recv,resp_send,resp_recv
 x1,web1,app1,1000000,1000100,1000400,1000200
 `;
+// 重复主机对 + 双向互相调用：web1/app1 之间 4 笔（两个方向都有），约束只聚合成 2 个有向主机对
+const SAMPLE_PAIR = `call_id,caller,callee,req_send,req_recv,resp_send,resp_recv
+dup,web1,app1,1000000,1000600,1000700,1001300
+dup,web1,app1,1001000,1001550,1001650,1002250
+dup,web1,app1,1002000,1002610,1002700,1003290
+back,app1,web1,1003000,1003400,1003500,1003800
+`;
 
 const $ = (id) => document.getElementById(id);
 const csvEl = $("csv"), limitEl = $("limit");
 
 $("sample-ok").onclick = () => { csvEl.value = SAMPLE_OK; limitEl.value = 200; };
 $("sample-bad").onclick = () => { csvEl.value = SAMPLE_BAD; limitEl.value = 200; };
+$("sample-pair").onclick = () => { csvEl.value = SAMPLE_PAIR; limitEl.value = 400; };
 $("file").addEventListener("change", (e) => {
   const f = e.target.files[0];
   if (!f) return;
@@ -130,6 +152,113 @@ function banner(kind, html) {
   return `<div class="banner ${kind}">${html}</div>`;
 }
 
+// ---- 浏览器端 CSV 解析（容忍 BOM、前导空行、字段两侧空白与引号包裹），与服务端口径一致 ----
+function parseCsvLine(line) {
+  const out = [];
+  let cur = "", inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; }
+        else inQuotes = false;
+      } else cur += ch;
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      out.push(cur); cur = "";
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+function parseCsv(text) {
+  if (!text || !text.trim()) throw new Error("CSV 内容为空");
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const rawLines = text.split(/\r\n|\r|\n/);
+  let start = 0;
+  while (start < rawLines.length && !rawLines[start].trim()) start++;
+  if (start >= rawLines.length) throw new Error("CSV 内容为空");
+  const header = parseCsvLine(rawLines[start]).map((h) => h.trim());
+  const missing = FIELDS.filter((f) => !header.includes(f));
+  if (missing.length) {
+    throw new Error(`CSV 表头缺少列：${missing.join("、")}；需要列：${FIELDS.join(",")}`);
+  }
+  const calls = [];
+  for (let li = start + 1; li < rawLines.length; li++) {
+    const line = rawLines[li];
+    if (!line.trim()) continue;
+    // 行号以表头为第 1 行；前导 BOM/空行不计，表头之后的行按相对位置连续编号
+    // （数据间空行两边都不处理，编号口径与服务端 DictReader.line_num 对齐）
+    const rowNum = li - start + 1;
+    const cells = parseCsvLine(line);
+    if (cells.length !== header.length) {
+      throw new Error(`第 ${rowNum} 行：列数（${cells.length}）与表头（${header.length}）不一致，请检查逗号`);
+    }
+    const rec = {};
+    header.forEach((h, i) => { rec[h] = cells[i].trim(); });
+    if (!rec.call_id) throw new Error(`第 ${rowNum} 行：call_id 为空`);
+    if (!rec.caller || !rec.callee) throw new Error(`第 ${rowNum} 行：调用方/服务方主机名为空`);
+    const ts = ["req_send", "req_recv", "resp_send", "resp_recv"].map((k) => {
+      if (!/^[+-]?\d+$/.test(rec[k])) throw new Error(`第 ${rowNum} 行：四个时刻必须是整数微秒`);
+      const n = Number(rec[k]);
+      if (!Number.isSafeInteger(n)) throw new Error(`第 ${rowNum} 行：时刻超出安全整数范围`);
+      return n;
+    });
+    calls.push({
+      call_id: rec.call_id, caller: rec.caller, callee: rec.callee,
+      t1: ts[0], t2: ts[1], t3: ts[2], t4: ts[3], row: rowNum,
+    });
+  }
+  if (!calls.length) throw new Error("CSV 中没有数据行");
+  if (calls.length > MAX_CALLS) throw new Error(`每批最多 ${MAX_CALLS} 笔调用，当前 ${calls.length} 笔`);
+  const hosts = [...new Set(calls.flatMap((c) => [c.caller, c.callee]))].sort();
+  if (hosts.length > MAX_HOSTS) throw new Error(`每批最多 ${MAX_HOSTS} 台主机，当前 ${hosts.length} 台`);
+  return { calls, hosts };
+}
+
+// ---- 按有向主机对聚合约束摘要：平行边取最紧，保留胜出约束的原表行号 ----
+function buildSummary(calls, hosts) {
+  // 嵌套 Map（u -> v -> 桶），不对主机名做字符串拼接，避免主机名含分隔符时碰撞
+  const nn = new Map();   // u -> v -> {w, row, leg}，非负桶取最小
+  const lim = new Map();  // u -> v -> {delta, row, leg}，上限桶取最大
+  const sub = (root, u) => {
+    if (!root.has(u)) root.set(u, new Map());
+    return root.get(u);
+  };
+  const putMin = (root, u, v, w, row, leg) => {
+    const m = sub(root, u), old = m.get(v);
+    if (!old || w < old.w) m.set(v, { w, row, leg });
+  };
+  const putMax = (root, u, v, delta, row, leg) => {
+    const m = sub(root, u), old = m.get(v);
+    if (!old || delta > old.delta) m.set(v, { delta, row, leg });
+  };
+  for (const c of calls) {
+    const dOut = c.t2 - c.t1, dRet = c.t4 - c.t3;
+    // 桶键 = 边的实际方向：非负去程 (a,b)、回程 (b,a)；上限去程 (b,a)、回程 (a,b)
+    putMin(nn, c.caller, c.callee, dOut, c.row, "out");
+    putMin(nn, c.callee, c.caller, dRet, c.row, "ret");
+    putMax(lim, c.callee, c.caller, dOut, c.row, "out");
+    putMax(lim, c.caller, c.callee, dRet, c.row, "ret");
+  }
+  const dirs = new Set();
+  for (const [u, m] of nn) for (const v of m.keys()) dirs.add(JSON.stringify([u, v]));
+  for (const [u, m] of lim) for (const v of m.keys()) dirs.add(JSON.stringify([u, v]));
+  const constraints = [];
+  for (const token of [...dirs].sort()) {
+    const [u, v] = JSON.parse(token);
+    const a = nn.get(u).get(v), b = lim.get(u).get(v);
+    constraints.push({
+      u, v,
+      nn_w: a.w, nn_row: a.row, nn_kind: a.leg,
+      lim_delta: b.delta, lim_row: b.row, lim_kind: b.leg,
+    });
+  }
+  return { hosts, constraints };
+}
+
 $("run").onclick = async () => {
   $("verdict").innerHTML = "";
   $("detail").innerHTML = "";
@@ -138,12 +267,21 @@ $("run").onclick = async () => {
     $("verdict").innerHTML = banner("err", "<b>输入有误：</b>单程耗时上限必须是非负整数（微秒）。");
     return;
   }
+  let parsed;
+  try {
+    parsed = parseCsv(csvEl.value);
+  } catch (err) {
+    $("verdict").innerHTML = banner("err", `<b>输入有误：</b>${esc(err.message)}`);
+    return;
+  }
+  const { calls, hosts } = parsed;
+  const summary = buildSummary(calls, hosts);
   let data;
   try {
-    const resp = await fetch("/api/analyze", {
+    const resp = await fetch("/api/analyze_summary", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ limit_us: limit, csv_text: csvEl.value }),
+      body: JSON.stringify({ limit_us: limit, hosts: summary.hosts, constraints: summary.constraints }),
     });
     data = await resp.json();
   } catch (err) {
@@ -154,51 +292,82 @@ $("run").onclick = async () => {
     $("verdict").innerHTML = banner("err", `<b>输入有误：</b>${esc(data.error)}`);
     return;
   }
-  render(data.result);
+  render(data.result, calls, summary);
 };
 
-function render(r) {
+function legName(leg) { return leg === "out" ? "去程非负" : "回程非负"; }
+
+function render(r, calls, summary) {
   let v = "", d = "";
   if (!r.consistent) {
-    v = banner("err", `<b>记录彼此矛盾，请复测。</b>以下约束无法同时成立（合计 ${r.contradiction.total_us} µs &lt; 0）：`);
-    d += `<div class="card"><h2>矛盾约束链</h2><ul class="steps">` +
-      r.contradiction.steps.map((s) => `<li class="mono">${esc(s)}</li>`).join("") +
-      `</ul></div>`;
+    const rowMap = new Map(calls.map((c) => [c.row, c]));
+    v = banner("err", `<b>记录彼此矛盾，请复测。</b>以下约束无法同时成立（合计 ${r.contradiction.total_us} µs &lt; 0），` +
+      `矛盾链对应原表行如下（即使调用号重复也可按行号定位）：`);
+    d += `<div class="card"><h2>矛盾约束链（按原表行号定位）</h2><ul class="steps">`;
+    for (const s of r.contradiction.steps) {
+      const rec = rowMap.get(s.row);
+      const who = rec ? `调用号 ${esc(rec.call_id)}，${esc(rec.caller)} → ${esc(rec.callee)}` : "原表该行不在当前数据中";
+      d += `<li>第 <b>${s.row}</b> 行（${who}）：<span class="mono">` +
+        `o[${esc(s.v)}] − o[${esc(s.u)}] ≤ ${s.w}</span>（${legName(s.leg)}）</li>`;
+    }
+    d += `</ul></div>`;
     $("verdict").innerHTML = v;
     $("detail").innerHTML = d;
     return;
   }
 
   if (r.feasible_with_limit) {
-    v = banner("ok", `<b>全部达标：</b>存在一组钟差使所有 ${r.calls.length} 笔调用的去程与回程同时 ≤ 上限 ${r.limit_us} µs。`);
+    v = banner("ok", `<b>全部达标：</b>存在一组钟差使所有 ${calls.length} 笔调用的去程与回程同时 ≤ 上限 ${r.limit_us} µs。`);
   } else {
     v = banner("warn", `<b>无法同时达标：</b>记录自洽，但不存在使所有调用两程同时 ≤ ${r.limit_us} µs 的钟差；` +
       `能解释这批记录的最小整数上限为 <b>${r.min_limit_us} µs</b>（下表给出一套满足该上限的钟差与逐笔耗时）。`);
   }
+  v += banner("ok", `本次上送约束摘要 <b>${summary.constraints.length}</b> 条（${calls.length} 笔调用按有向主机对聚合，` +
+    `不含调用号与原始时刻），涉及 ${r.hosts.length} 台主机。`).replace('class="banner ok"', 'class="banner ok" style="margin-top:10px"');
 
-  d += `<div class="card"><h2>逐笔可达范围（仅基于“钟差固定 + 两程非负”）</h2>`;
-  d += `<table><thead><tr><th>调用号</th><th>方向</th>` +
+  // 全源最短路界：bounds 只含有穷项，同主机对上界为 0（嵌套 Map，不拼接主机名）
+  const upper = new Map();
+  for (const b of r.bounds) {
+    if (!upper.has(b.u)) upper.set(b.u, new Map());
+    upper.get(b.u).set(b.v, b.upper);
+  }
+  // 每笔调用自身就建了双向边，同组内界必有穷；非连通组间取不到界时按无界（∞）展示
+  const bound = (u, x) => u === x ? 0 : upper.get(u)?.get(x);
+  const fmt = (n) => (n === undefined ? "∞" : n);
+
+  d += `<div class="card"><h2>逐笔可达范围（浏览器内按服务端同一套最短路界、套回原始时刻计算）</h2>`;
+  d += `<table><thead><tr><th>调用号</th><th>原表行</th><th>方向</th>` +
     `<th class="num">去程可达范围 (µs)</th><th class="num">回程可达范围 (µs)</th><th>备注</th></tr></thead><tbody>`;
-  for (const c of r.calls) {
-    d += `<tr><td>${esc(c.call_id)}</td><td>${esc(c.caller)} → ${esc(c.callee)}</td>` +
-      `<td class="num">[${c.out_min}, ${c.out_max}]</td>` +
-      `<td class="num">[${c.ret_min}, ${c.ret_max}]</td>` +
-      `<td>${c.must_exceed ? '<span class="tag">该笔必然超限</span>' : ""}</td></tr>`;
+  for (const c of calls) {
+    const dAb = bound(c.caller, c.callee);
+    const dBa = bound(c.callee, c.caller);
+    const dOut = c.t2 - c.t1, dRet = c.t4 - c.t3;
+    const outMin = dAb === undefined ? undefined : dOut - dAb;
+    const outMax = dBa === undefined ? undefined : dOut + dBa;
+    const retMin = dBa === undefined ? undefined : dRet - dBa;
+    const retMax = dAb === undefined ? undefined : dRet + dAb;
+    const mustExceed = outMin !== undefined && (outMin > r.limit_us || retMin > r.limit_us);
+    d += `<tr><td>${esc(c.call_id)}</td><td class="num">${c.row}</td><td>${esc(c.caller)} → ${esc(c.callee)}</td>` +
+      `<td class="num">[${fmt(outMin)}, ${fmt(outMax)}]</td><td class="num">[${fmt(retMin)}, ${fmt(retMax)}]</td>` +
+      `<td>${mustExceed ? '<span class="tag">该笔必然超限</span>' : ""}</td></tr>`;
   }
   d += `</tbody></table></div>`;
 
-  d += `<div class="card"><h2>一组可行钟差（${esc(r.assignment_note)}，最小值已归零）</h2>`;
+  d += `<div class="card"><h2>一组可行钟差（${esc(r.offsets_note)}，最小值已归零）</h2>`;
   d += `<table><thead><tr><th>主机</th><th class="num">相对钟差 o (µs)</th></tr></thead><tbody>`;
   for (const h of r.hosts) {
     d += `<tr><td>${esc(h)}</td><td class="num">${r.offsets[h]}</td></tr>`;
   }
   d += `</tbody></table>`;
-  d += `<h2 style="margin-top:16px">该组钟差下的逐笔耗时</h2>`;
-  d += `<table><thead><tr><th>调用号</th><th>方向</th>` +
+  d += `<h2 style="margin-top:16px">该组钟差下的逐笔耗时（浏览器内按同一套钟差计算）</h2>`;
+  d += `<table><thead><tr><th>调用号</th><th>原表行</th><th>方向</th>` +
     `<th class="num">去程 (µs)</th><th class="num">回程 (µs)</th></tr></thead><tbody>`;
-  for (const a of r.assignment) {
-    d += `<tr><td>${esc(a.call_id)}</td><td>${esc(a.caller)} → ${esc(a.callee)}</td>` +
-      `<td class="num">${a.out_us}</td><td class="num">${a.ret_us}</td></tr>`;
+  for (const c of calls) {
+    const diff = r.offsets[c.callee] - r.offsets[c.caller];
+    const outUs = (c.t2 - c.t1) - diff;
+    const retUs = (c.t4 - c.t3) + diff;
+    d += `<tr><td>${esc(c.call_id)}</td><td class="num">${c.row}</td><td>${esc(c.caller)} → ${esc(c.callee)}</td>` +
+      `<td class="num">${outUs}</td><td class="num">${retUs}</td></tr>`;
   }
   d += `</tbody></table></div>`;
 
